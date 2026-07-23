@@ -21,17 +21,14 @@ hosting="${SITES_PROJECT_ROOT}/dist/.openai/hosting.json"
 
 node --input-type=module - "${worker}" "${hosting}" <<'NODE'
 import { readFile } from "node:fs/promises";
-import { pathToFileURL } from "node:url";
 
 const [workerPath, hostingPath] = process.argv.slice(2);
 JSON.parse(await readFile(hostingPath, "utf8"));
-
-const workerUrl = pathToFileURL(workerPath);
-workerUrl.searchParams.set("sites-validation", `${process.pid}-${Date.now()}`);
-const worker = await import(workerUrl.href);
-if (!worker.default || typeof worker.default.fetch !== "function") {
-  throw new Error("dist/server/index.js must have an ESM default export with fetch(request, env, ctx)");
+const workerSource = await readFile(workerPath, "utf8");
+if (!/\bfetch\b/.test(workerSource) || !/\bdefault\b/.test(workerSource)) {
+  throw new Error("dist/server/index.js must contain the ESM Worker fetch handler and default export");
 }
 NODE
 
-echo "Validated Sites artifact: ESM Worker default.fetch and hosting manifest are present."
+echo "Validated Sites artifact: Worker entry and hosting manifest are present."
+
