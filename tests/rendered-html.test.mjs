@@ -32,7 +32,7 @@ test("keeps the OpenAI key in the Cloudflare server route only", async () => {
   assert.doesNotMatch(route, /NEXT_PUBLIC_OPENAI|VITE_OPENAI/);
 });
 
-test("uses one compact OpenAI request and returns the workbook prompt without local templates", async () => {
+test("uses one compact OpenAI request and returns a prompt-only workbook workflow", async () => {
   const raw = "go to folder [xxx] and find Excel workbook named [xx], get content of that workbook, and apply it on the dashboard Excel workbook named [x] without any change on the style, and using only the [xx] workbook content.";
   const expected = "Go to the folder [xxx] and locate the Excel workbook named [xx].\n\nUse workbook [xx] as the only source of data.\n\nOpen the dashboard Excel workbook named [x] and update it using only the content from workbook [xx].\n\nPreserve the dashboard's existing style, layout, formatting, formulas, charts, colors, and structure.\n\nDo not use any other files, assumptions, previous versions, or external data.\n\nDo not modify the source workbook [xx].\n\nIf any required mapping is unclear, stop and ask only the necessary clarification.\n\nReturn only the updated dashboard Excel workbook named [x].";
 
@@ -45,8 +45,12 @@ test("uses one compact OpenAI request and returns the workbook prompt without lo
     assert.equal(payload.temperature, 0.2);
     assert.equal(payload.max_output_tokens, 700);
     assert.equal(payload.store, false);
-    assert.ok(payload.instructions.length < 500);
-    assert.doesNotMatch(payload.instructions, /Goal|Objective|Output|example/i);
+    assert.ok(payload.instructions.length < 550);
+    assert.doesNotMatch(payload.instructions, /(?:^|\n)(?:Goal|Objective|Output):/im);
+    assert.match(payload.instructions, /never do the task/i);
+    assert.match(payload.instructions, /email, report, JSON, formula, table, or document/i);
+    assert.match(payload.instructions, /Keep unavailable items as written/i);
+    assert.match(payload.instructions, /4-7 lines for simple tasks and 8-12 for workflows\/file updates/i);
     return json({ output_text: expected });
   }, async () => {
     const response = await postPrompt({ request: raw }, { apiKey: "test-key" });
@@ -55,16 +59,33 @@ test("uses one compact OpenAI request and returns the workbook prompt without lo
   });
 });
 
-test("returns a second optimized prompt exactly as supplied by the model", async () => {
-  const expected = "Review the provided text and rewrite it as a concise, friendly email. Preserve all facts and names exactly. Return only the ready-to-send email.";
-  await withOpenAiMock(
-    async () => json({ output: [{ content: [{ type: "output_text", text: `\`\`\`text\n${expected}\n\`\`\`` }] }] }),
-    async () => {
-      const response = await postPrompt({ request: "rewrite this into a friendly email" }, { apiKey: "test-key" });
-      assert.equal(response.status, 200);
-      assert.deepEqual(await response.json(), { prompt: expected });
-    },
-  );
+test("keeps email and JSON requests as optimized prompts for another AI", async () => {
+  const emailRequest = "write an email to [employee name] about [y]";
+  const emailPrompt = "Write a concise, friendly email to [employee name] about [y].\nPreserve the provided facts and names exactly.\nUse a warm, professional tone.\nReturn only the ready-to-send email.";
+  const jsonRequest = "create JSON for [employee name] using [y]";
+  const jsonPrompt = "Create valid JSON for [employee name] using [y].\nPreserve the placeholders and requested values exactly.\nUse only the requested fields and structure.\nReturn only the JSON.";
+  const requests = [emailRequest, jsonRequest];
+  const outputs = [emailPrompt, jsonPrompt];
+  let call = 0;
+
+  await withOpenAiMock(async (_url, init) => {
+    const payload = JSON.parse(init.body);
+    assert.equal(payload.input, requests[call]);
+    assert.match(payload.instructions, /prompt for another AI/i);
+    assert.match(payload.instructions, /never do the task/i);
+    const output = outputs[call++];
+    return json({ output: [{ content: [{ type: "output_text", text: `\`\`\`text\n${output}\n\`\`\`` }] }] });
+  }, async () => {
+    const emailResponse = await postPrompt({ request: emailRequest }, { apiKey: "test-key" });
+    assert.equal(emailResponse.status, 200);
+    assert.deepEqual(await emailResponse.json(), { prompt: emailPrompt });
+    assert.doesNotMatch(emailPrompt, /^Dear\b/i);
+
+    const jsonResponse = await postPrompt({ request: jsonRequest }, { apiKey: "test-key" });
+    assert.equal(jsonResponse.status, 200);
+    assert.deepEqual(await jsonResponse.json(), { prompt: jsonPrompt });
+    assert.doesNotMatch(jsonPrompt, /^\s*\{/);
+  });
 });
 
 test("rejects empty, oversized, and invalid JSON requests clearly", async () => {
@@ -119,4 +140,5 @@ test("maps OpenAI failures, rate limits, timeouts, and unusable responses to saf
     assert.match((await response.json()).error, /no usable text/i);
   });
 });
+
 

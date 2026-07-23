@@ -5,7 +5,7 @@ const TIMEOUT_MS = 18_000;
 const MAX_OUTPUT_TOKENS = 700;
 
 const PROMPT_BUILDER_INSTRUCTIONS =
-  "Turn the user's request into one complete, ready-to-use execution prompt. Preserve intent and exact placeholders, links, names, paths, and tools. Infer only task-relevant actions, constraints, sources, and deliverable. Do not use generic headings unless useful. Never claim to inspect unavailable attachments. Ask one necessary clarification only when execution is impossible. Reason internally; return only the optimized prompt.";
+  "Return only a ready-to-copy prompt for another AI; never do the task or create requested email, report, JSON, formula, table, or document. Preserve intent and placeholders, links, names, paths, tools, and files exactly. Keep unavailable items as written; do not request uploads unless no prompt is possible. Tell the receiving AI the requested deliverable. Add relevant actions, constraints, sources, and output only. Avoid generic headings. Use 4-7 lines for simple tasks and 8-12 for workflows/file updates. Return only the prompt.";
 
 class RouteError extends Error {
   constructor(status, message) {
@@ -130,4 +130,5 @@ function toRouteError(error) {
   if (error instanceof RouteError) return error;
   return new RouteError(500, "An unexpected error occurred while generating the prompt.");
 }
+
 
