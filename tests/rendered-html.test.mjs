@@ -1,50 +1,14 @@
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
-import { after, test } from "node:test";
-import { createServer } from "vite";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+import { handlePromptBuilderRequest } from "../app/api/prompt-builder/prompt-builder.mjs";
 
-const projectRoot = fileURLToPath(new URL("../", import.meta.url));
-const TEST_ENV_KEY = "__promptFinderTestEnv";
-let viteServer;
-let route;
-
-async function loadRoute() {
-  if (!viteServer) {
-    viteServer = await createServer({
-      root: projectRoot,
-      configFile: false,
-      appType: "custom",
-      plugins: [{
-        name: "prompt-builder-test-cloudflare-workers",
-        enforce: "pre",
-        resolveId(id) {
-          return id === "cloudflare:workers" ? "\0prompt-builder-test-cloudflare-workers" : null;
-        },
-        load(id) {
-          return id === "\0prompt-builder-test-cloudflare-workers"
-            ? `export const env = new Proxy({}, { get: (_, key) => globalThis.${TEST_ENV_KEY}?.[key] });`
-            : null;
-        },
-      }],
-      server: { middlewareMode: true },
-      ssr: { noExternal: true },
-    });
-  }
-
-  route ??= await viteServer.ssrLoadModule("/app/api/prompt-builder/route.ts");
-  return route;
-}
-
-after(async () => { await viteServer?.close(); });
-
-async function postPrompt(body, { headers = {}, env = {} } = {}) {
-  globalThis[TEST_ENV_KEY] = env;
-  const { POST } = await loadRoute();
-  return POST(new Request("http://localhost/api/prompt-builder", {
+async function postPrompt(body, { headers = {}, apiKey } = {}) {
+  return handlePromptBuilderRequest(new Request("http://localhost/api/prompt-builder", {
     method: "POST",
     headers: { "content-type": "application/json", ...headers },
     body: typeof body === "string" ? body : JSON.stringify(body),
-  }));
+  }), apiKey);
 }
 
 async function withOpenAiMock(mock, action) {
@@ -60,6 +24,13 @@ async function withOpenAiMock(mock, action) {
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 }
+
+test("keeps the OpenAI key in the Cloudflare server route only", async () => {
+  const route = await readFile(new URL("../app/api/prompt-builder/route.ts", import.meta.url), "utf8");
+  assert.match(route, /import \{ env \} from "cloudflare:workers"/);
+  assert.match(route, /OPENAI_API_KEY/);
+  assert.doesNotMatch(route, /NEXT_PUBLIC_OPENAI|VITE_OPENAI/);
+});
 
 test("uses one compact OpenAI request and returns the workbook prompt without local templates", async () => {
   const raw = "go to folder [xxx] and find Excel workbook named [xx], get content of that workbook, and apply it on the dashboard Excel workbook named [x] without any change on the style, and using only the [xx] workbook content.";
@@ -78,7 +49,7 @@ test("uses one compact OpenAI request and returns the workbook prompt without lo
     assert.doesNotMatch(payload.instructions, /Goal|Objective|Output|example/i);
     return json({ output_text: expected });
   }, async () => {
-    const response = await postPrompt({ request: raw }, { env: { OPENAI_API_KEY: "test-key" } });
+    const response = await postPrompt({ request: raw }, { apiKey: "test-key" });
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { prompt: expected });
   });
@@ -86,11 +57,10 @@ test("uses one compact OpenAI request and returns the workbook prompt without lo
 
 test("returns a second optimized prompt exactly as supplied by the model", async () => {
   const expected = "Review the provided text and rewrite it as a concise, friendly email. Preserve all facts and names exactly. Return only the ready-to-send email.";
-
   await withOpenAiMock(
     async () => json({ output: [{ content: [{ type: "output_text", text: `\`\`\`text\n${expected}\n\`\`\`` }] }] }),
     async () => {
-      const response = await postPrompt({ request: "rewrite this into a friendly email" }, { env: { OPENAI_API_KEY: "test-key" } });
+      const response = await postPrompt({ request: "rewrite this into a friendly email" }, { apiKey: "test-key" });
       assert.equal(response.status, 200);
       assert.deepEqual(await response.json(), { prompt: expected });
     },
@@ -118,34 +88,33 @@ test("reports missing server configuration without exposing a key", async () => 
 });
 
 test("maps OpenAI failures, rate limits, timeouts, and unusable responses to safe errors", async () => {
-  const env = { OPENAI_API_KEY: "test-key" };
-
+  const apiKey = "test-key";
   await withOpenAiMock(async () => json({ error: { message: "Provider failed" } }, 500), async () => {
-    const response = await postPrompt({ request: "Create a prompt" }, { env });
+    const response = await postPrompt({ request: "Create a prompt" }, { apiKey });
     assert.equal(response.status, 502);
     assert.match((await response.json()).error, /temporarily unavailable/i);
   });
 
   await withOpenAiMock(async () => json({ error: { message: "Too many requests" } }, 429), async () => {
-    const response = await postPrompt({ request: "Create a prompt" }, { env });
+    const response = await postPrompt({ request: "Create a prompt" }, { apiKey });
     assert.equal(response.status, 429);
     assert.match((await response.json()).error, /busy/i);
   });
 
   await withOpenAiMock(async () => { throw new DOMException("Aborted", "AbortError"); }, async () => {
-    const response = await postPrompt({ request: "Create a prompt" }, { env });
+    const response = await postPrompt({ request: "Create a prompt" }, { apiKey });
     assert.equal(response.status, 504);
     assert.match((await response.json()).error, /timed out/i);
   });
 
   await withOpenAiMock(async () => new Response("not json", { status: 200 }), async () => {
-    const response = await postPrompt({ request: "Create a prompt" }, { env });
+    const response = await postPrompt({ request: "Create a prompt" }, { apiKey });
     assert.equal(response.status, 502);
     assert.match((await response.json()).error, /no usable text/i);
   });
 
   await withOpenAiMock(async () => json({ output_text: "" }), async () => {
-    const response = await postPrompt({ request: "Create a prompt" }, { env });
+    const response = await postPrompt({ request: "Create a prompt" }, { apiKey });
     assert.equal(response.status, 502);
     assert.match((await response.json()).error, /no usable text/i);
   });
