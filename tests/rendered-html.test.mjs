@@ -10,38 +10,49 @@ async function loadWorker() {
   return (await import(workerUrl.href)).default;
 }
 
-async function postPrompt(worker, body) {
+function workerEnv(overrides = {}) {
+  return {
+    ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) },
+    ...overrides,
+  };
+}
+
+function executionContext() {
+  return { waitUntil() {}, passThroughOnException() {} };
+}
+
+async function postPrompt(worker, body, { headers = {}, env = {} } = {}) {
   return worker.fetch(
     new Request("http://localhost/api/prompt-builder", {
       method: "POST",
-      headers: { "content-type": "text/plain" },
-      body,
+      headers: { "content-type": "application/json", ...headers },
+      body: typeof body === "string" ? body : JSON.stringify(body),
     }),
-    {
-      ASSETS: {
-        fetch: async () => new Response("Not found", { status: 404 }),
-      },
-    },
-    {
-      waitUntil() {},
-      passThroughOnException() {},
-    },
+    workerEnv(env),
+    executionContext(),
   );
+}
+
+async function withOpenAiMock(mock, action) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = mock;
+  try {
+    return await action();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 }
 
 test("renders development preview metadata", async () => {
   const worker = await loadWorker();
   const response = await worker.fetch(
     new Request("http://localhost/", { headers: { accept: "text/html" } }),
-    {
-      ASSETS: {
-        fetch: async () => new Response("Not found", { status: 404 }),
-      },
-    },
-    {
-      waitUntil() {},
-      passThroughOnException() {},
-    },
+    workerEnv(),
+    executionContext(),
   );
 
   assert.equal(response.status, 200);
@@ -49,70 +60,95 @@ test("renders development preview metadata", async () => {
   assert.match(await response.text(), developmentPreviewMeta);
 });
 
-test("prompt builder returns a direct concise prompt", async () => {
+test("uses one compact OpenAI request and returns the workbook prompt without local templates", async () => {
   const worker = await loadWorker();
-  const response = await postPrompt(worker, "clean report for management with risks and next steps");
-  const data = await response.json();
+  const raw = "go to folder [xxx] and find Excel workbook named [xx], get content of that workbook, and apply it on the dashboard Excel workbook named [x] without any change on the style, and using only the [xx] workbook content.";
+  const expected = "Go to the folder [xxx] and locate the Excel workbook named [xx].\n\nUse workbook [xx] as the only source of data.\n\nOpen the dashboard Excel workbook named [x] and update it using only the content from workbook [xx].\n\nPreserve the dashboard’s existing style, layout, formatting, formulas, charts, colors, and structure.\n\nDo not use any other files, assumptions, previous versions, or external data.\n\nDo not modify the source workbook [xx].\n\nIf any required mapping is unclear, stop and ask only the necessary clarification.\n\nReturn only the updated dashboard Excel workbook named [x].";
 
-  assert.equal(response.status, 200);
-  assert.deepEqual(Object.keys(data), ["prompt"]);
-  assert.match(data.prompt, /^Clean report for management with risks and next steps/);
-  assert.match(data.prompt, /Return only the requested report\./);
-  assert.doesNotMatch(data.prompt, /\bGoal\b|\bInstructions\b|\bOutput\b/);
-  assert.doesNotMatch(data.prompt, /Act as an expert assistant|Clarify the objective|formula guidance/);
-  assert.doesNotMatch(data.prompt, /Preserve all stated restrictions|Deliver the requested report/);
-  assert.doesNotMatch(data.prompt, /^```/);
+  await withOpenAiMock(async (url, init) => {
+    assert.equal(String(url), "https://api.openai.com/v1/responses");
+    assert.equal(init.method, "POST");
+    const payload = JSON.parse(init.body);
+    assert.equal(payload.input, raw);
+    assert.equal(payload.model, "gpt-4.1-mini");
+    assert.equal(payload.temperature, 0.2);
+    assert.equal(payload.max_output_tokens, 700);
+    assert.equal(payload.store, false);
+    assert.ok(payload.instructions.length < 500);
+    assert.doesNotMatch(payload.instructions, /Goal|Objective|Output|example/i);
+    return json({ output_text: expected });
+  }, async () => {
+    const response = await postPrompt(worker, { request: raw }, { env: { OPENAI_API_KEY: "test-key" } });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { prompt: expected });
+  });
 });
 
-test("simple email rewrite stays short and context-aware", async () => {
+test("returns a second optimized prompt exactly as supplied by the model", async () => {
   const worker = await loadWorker();
-  const response = await postPrompt(worker, "Rewrite this email in a friendly and natural tone while preserving the original meaning.");
-  const data = await response.json();
-  const lines = data.prompt.split("\n");
+  const expected = "Review the provided text and rewrite it as a concise, friendly email. Preserve all facts and names exactly. Return only the ready-to-send email.";
 
-  assert.ok(lines.length >= 4 && lines.length <= 7);
-  assert.equal((data.prompt.match(/original meaning/gi) || []).length, 1);
-  assert.match(data.prompt, /Return only the ready-to-send email\./);
-  assert.doesNotMatch(data.prompt, /source files|folders|external data|placeholders|validation|Deliver/);
+  await withOpenAiMock(async () => json({ output: [{ content: [{ type: "output_text", text: `\`\`\`text\n${expected}\n\`\`\`` }] }] }), async () => {
+    const response = await postPrompt(worker, { request: "rewrite this into a friendly email" }, { env: { OPENAI_API_KEY: "test-key" } });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { prompt: expected });
+  });
 });
 
-test("simple summary stays short without file safeguards", async () => {
+test("rejects empty, oversized, and invalid JSON requests clearly", async () => {
   const worker = await loadWorker();
-  const response = await postPrompt(worker, "Summarize the discussion in five short bullets.");
-  const data = await response.json();
-  const lines = data.prompt.split("\n");
+  const empty = await postPrompt(worker, { request: "   " });
+  assert.equal(empty.status, 400);
+  assert.match((await empty.json()).error, /Add a short request/);
 
-  assert.ok(lines.length >= 4 && lines.length <= 7);
-  assert.match(data.prompt, /Keep the key facts, decisions, and actions\./);
-  assert.match(data.prompt, /Return only the requested summary\./);
-  assert.doesNotMatch(data.prompt, /source files|folders|placeholders|Deliver/);
+  const oversized = await postPrompt(worker, { request: "x".repeat(12_001) });
+  assert.equal(oversized.status, 413);
+  assert.match((await oversized.json()).error, /too long/i);
+
+  const invalid = await postPrompt(worker, "{", { headers: { "content-type": "application/json" } });
+  assert.equal(invalid.status, 400);
+  assert.match((await invalid.json()).error, /valid JSON/i);
 });
 
-test("prompt builder preserves workbook output and placeholders", async () => {
+test("reports missing server configuration without exposing a key", async () => {
   const worker = await loadWorker();
-  const raw = "go to folder [xxx] and find Excel workbook named [xx], get content of that workbook, and apply it on the dashboard Excel workbook named [x]. Return only the updated dashboard without any change on the style, and using only the [xx] workbook content.";
-  const response = await postPrompt(worker, raw);
-  const data = await response.json();
-  const lines = data.prompt.split("\n");
-
-  assert.equal(lines.length, 10);
-  assert.equal(lines[0], "Open folder [xxx].");
-  assert.match(data.prompt, /Find the Excel workbook named \[xx\]\./);
-  assert.match(data.prompt, /Open the dashboard Excel workbook named \[x\]\./);
-  assert.match(data.prompt, /Use only \[xx\] as the content source; do not add external data\./);
-  assert.match(data.prompt, /Preserve the dashboard's existing style, layout, formatting, formulas, and structure\./);
-  assert.equal(lines.at(-1), "Return only the updated dashboard Excel workbook [x].");
-  assert.doesNotMatch(data.prompt, /guidance|Act as an expert|Clarify the objective/);
+  const response = await postPrompt(worker, { request: "Create a short prompt" });
+  assert.equal(response.status, 503);
+  assert.match((await response.json()).error, /OPENAI_API_KEY/);
 });
 
-test("prompt builder keeps JSON as the requested output", async () => {
+test("maps OpenAI failures, rate limits, timeouts, and unusable responses to safe errors", async () => {
   const worker = await loadWorker();
-  const response = await postPrompt(worker, "Convert the attached source data into JSON using only the provided file. Return only JSON.");
-  const data = await response.json();
+  const env = { OPENAI_API_KEY: "test-key" };
 
-  assert.match(data.prompt, /using only the provided file/i);
-  assert.match(data.prompt, /Return only the requested JSON\./);
-  assert.equal((data.prompt.match(/(?:use|using) only/gi) || []).length, 1);
-  assert.doesNotMatch(data.prompt, /Preserve all stated restrictions|Deliver the requested/);
-  assert.doesNotMatch(data.prompt, /formula guidance|explanation/);
+  await withOpenAiMock(async () => json({ error: { message: "Provider failed" } }, 500), async () => {
+    const response = await postPrompt(worker, { request: "Create a prompt" }, { env });
+    assert.equal(response.status, 502);
+    assert.match((await response.json()).error, /temporarily unavailable/i);
+  });
+
+  await withOpenAiMock(async () => json({ error: { message: "Too many requests" } }, 429), async () => {
+    const response = await postPrompt(worker, { request: "Create a prompt" }, { env });
+    assert.equal(response.status, 429);
+    assert.match((await response.json()).error, /busy/i);
+  });
+
+  await withOpenAiMock(async () => { throw new DOMException("Aborted", "AbortError"); }, async () => {
+    const response = await postPrompt(worker, { request: "Create a prompt" }, { env });
+    assert.equal(response.status, 504);
+    assert.match((await response.json()).error, /timed out/i);
+  });
+
+  await withOpenAiMock(async () => new Response("not json", { status: 200 }), async () => {
+    const response = await postPrompt(worker, { request: "Create a prompt" }, { env });
+    assert.equal(response.status, 502);
+    assert.match((await response.json()).error, /no usable text/i);
+  });
+
+  await withOpenAiMock(async () => json({ output_text: "" }), async () => {
+    const response = await postPrompt(worker, { request: "Create a prompt" }, { env });
+    assert.equal(response.status, 502);
+    assert.match((await response.json()).error, /no usable text/i);
+  });
 });
+

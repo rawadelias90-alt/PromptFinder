@@ -1,196 +1,152 @@
-const FOLLOW_UP_TRIGGERS = new Set([
-  "write something",
-  "make something",
-  "create something",
-  "fix it",
-  "improve it",
-  "do this",
-]);
+import { env } from "cloudflare:workers";
+
+const OPENAI_URL = "https://api.openai.com/v1/responses";
+const MODEL = "gpt-4.1-mini";
+const MAX_REQUEST_CHARS = 12_000;
+const TIMEOUT_MS = 18_000;
+const MAX_OUTPUT_TOKENS = 700;
+
+// Kept deliberately short so each request contains only the user's request and
+// the rules needed to turn it into an immediately usable prompt.
+const PROMPT_BUILDER_INSTRUCTIONS =
+  "Turn the user's request into one complete, ready-to-use execution prompt. Preserve intent and exact placeholders, links, names, paths, and tools. Infer only task-relevant actions, constraints, sources, and deliverable. Do not use generic headings unless useful. Never claim to inspect unavailable attachments. Ask one necessary clarification only when execution is impossible. Reason internally; return only the optimized prompt.";
+
+type RuntimeEnv = { OPENAI_API_KEY?: string };
+type OpenAIResponse = {
+  output_text?: unknown;
+  output?: Array<{ content?: Array<{ type?: unknown; text?: unknown }> }>;
+};
+
+class RouteError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
 
 export async function POST(request: Request) {
+  try {
+    const rawRequest = await readPromptRequest(request);
+    const apiKey = ((env as unknown as RuntimeEnv).OPENAI_API_KEY || "").trim();
+
+    if (!apiKey) {
+      throw new RouteError(503, "Prompt generation is not configured. Add OPENAI_API_KEY to the site's server environment.");
+    }
+
+    const prompt = await generatePrompt(rawRequest, apiKey);
+    return Response.json({ prompt });
+  } catch (error) {
+    const routeError = toRouteError(error);
+    return Response.json({ error: routeError.message }, { status: routeError.status });
+  }
+}
+
+async function readPromptRequest(request: Request) {
+  const declaredLength = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_CHARS) {
+    throw new RouteError(413, `Your request is too long. Keep it under ${MAX_REQUEST_CHARS.toLocaleString()} characters.`);
+  }
+
   const contentType = request.headers.get("content-type") || "";
-  let rawRequest = "";
+  let value: unknown;
 
   if (contentType.includes("application/json")) {
-    const body = await request.json().catch(() => ({}));
-    rawRequest = typeof body === "string" ? body : String(body?.request || body?.rawRequest || "");
-  } else {
-    rawRequest = await request.text();
-  }
-
-  return Response.json({ prompt: buildOptimizedPrompt(rawRequest) });
-}
-
-function buildOptimizedPrompt(rawValue: string) {
-  const raw = rawValue.replace(/\r\n/g, "\n").trim();
-  if (!raw) return "";
-
-  const lower = raw.toLowerCase();
-  if (raw.length < 16 || FOLLOW_UP_TRIGGERS.has(lower)) {
-    return "Provide the exact task and required final output.";
-  }
-
-  const workbookTransfer = buildWorkbookTransferPrompt(raw, lower);
-  if (workbookTransfer) return workbookTransfer;
-
-  const output = inferOutputContract(raw, lower);
-  const simplePrompt = buildSimplePrompt(raw, lower, output);
-  if (simplePrompt) return simplePrompt;
-
-  const lines = splitIntoDirectSteps(raw);
-  const sourceRestricted = mentionsSpecifiedSources(lower);
-
-  if (hasPlaceholders(raw) && !lines.some((line) => /preserve (?:every|all) placeholder/i.test(line))) {
-    lines.push("Preserve every placeholder exactly as written.");
-  }
-  if (sourceRestricted && !lines.some((line) => /\b(use|using)\s+only\b|\bsource[- ]only\b/i.test(line))) {
-    lines.push("Use only the specified source files, folders, links, or data; do not add external content.");
-  } else if (prohibitsExternalData(lower) && !lines.some((line) => /\bexternal (?:data|content)\b/i.test(line))) {
-    lines.push("Do not use external data or add unsupported content.");
-  }
-  if (requiresNoStyleChanges(lower) && !lines.some((line) => /\b(style|layout|formatting)\b/i.test(line))) {
-    lines.push("Preserve the existing style, layout, formatting, and structure.");
-  }
-  if (requiresExactContent(lower) && !lines.some((line) => /\b(as is|exact|unchanged|do not (?:rewrite|change))\b/i.test(line))) {
-    lines.push("Do not rewrite, shorten, expand, or change content that must remain exact.");
-  }
-
-  lines.push(`Return only ${output}.`);
-  return uniqueLines(lines).join("\n");
-}
-
-function buildSimplePrompt(raw: string, lower: string, output: string) {
-  if (isFileBasedTask(lower)) return "";
-
-  const isEmail = /\bemail\b/.test(lower);
-  const isMessage = /\b(message|reply)\b/.test(lower);
-  const isSummary = /\bsummary\b|\bsummari[sz]e\b/.test(lower);
-  const isRewrite = /\b(rewrite|rephrase|refine|polish|improve the wording)\b/.test(lower);
-  if (!isEmail && !isMessage && !isSummary && !isRewrite) return "";
-
-  const lines = [makeDirectInstruction(raw)];
-
-  if (isSummary) {
-    lines.push("Keep the key facts, decisions, and actions.");
-    lines.push("Do not add information that is not in the source.");
-    lines.push("Keep it concise and easy to scan.");
-  } else if (isRewrite) {
-    if (!/\b(preserv\w*|keep\w*)\b[^.]{0,40}\b(original )?(meaning|facts)\b/.test(lower)) {
-      lines.push("Preserve the original meaning and facts.");
+    try {
+      value = await request.json();
+    } catch {
+      throw new RouteError(400, "The request body must contain valid JSON.");
     }
-    lines.push("Improve clarity, grammar, and flow.");
-    lines.push(isEmail || isMessage ? "Keep the wording natural, concise, and ready to send." : "Keep the wording natural and concise.");
+    value = typeof value === "string" ? value : value && typeof value === "object" ? (value as { request?: unknown }).request : undefined;
   } else {
-    lines.push("Use clear, natural language suited to the audience.");
-    lines.push("Keep it concise and ready to send.");
+    value = await request.text();
   }
 
-  lines.push(`Return only ${output}.`);
-  return uniqueLines(lines).join("\n");
+  if (typeof value !== "string") {
+    throw new RouteError(400, "Provide your request as text or as a JSON object with a request field.");
+  }
+
+  const rawRequest = value.trim();
+  if (!rawRequest) {
+    throw new RouteError(400, "Add a short request before generating a prompt.");
+  }
+  if (rawRequest.length > MAX_REQUEST_CHARS) {
+    throw new RouteError(413, `Your request is too long. Keep it under ${MAX_REQUEST_CHARS.toLocaleString()} characters.`);
+  }
+
+  return rawRequest;
 }
 
-function splitIntoDirectSteps(raw: string) {
-  const normalized = raw.replace(/\r\n/g, "\n").replace(/\n+/g, ". ").trim();
-  const parts = normalized
-    .split(/(?<=[.!?;])\s+|,\s+(?:and\s+)?(?=(?:find|get|review|open|apply|update|copy|transfer|use|keep|preserve|validate|check|create|return|do not)\b)/i)
-    .map((part) => part.replace(/^[\s,;]+|[\s,;]+$/g, "").trim())
-    .filter(Boolean)
-    .filter((part) => !/^return only\b/i.test(part));
+async function generatePrompt(rawRequest: string, apiKey: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
-  const steps = parts.map((part) => {
-    const direct = makeDirectInstruction(part).replace(/[.!?]+$/g, "");
-    return `${direct}.`;
-  });
+  try {
+    const response = await fetch(OPENAI_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        instructions: PROMPT_BUILDER_INSTRUCTIONS,
+        input: rawRequest,
+        temperature: 0.2,
+        max_output_tokens: MAX_OUTPUT_TOKENS,
+        store: false,
+      }),
+      signal: controller.signal,
+    });
 
-  return steps.length ? steps : [makeDirectInstruction(raw)];
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new RouteError(response.status === 429 ? 429 : 502, openAiFailureMessage(response.status, payload));
+    }
+
+    const prompt = extractPrompt(payload);
+    if (!prompt) {
+      throw new RouteError(502, "Prompt generation returned no usable text. Please try again.");
+    }
+    return prompt;
+  } catch (error) {
+    if (error instanceof RouteError) throw error;
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new RouteError(504, "Prompt generation timed out. Please try again.");
+    }
+    throw new RouteError(502, "Prompt generation is temporarily unavailable. Please try again.");
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
-function buildWorkbookTransferPrompt(raw: string, lower: string) {
-  if (!lower.includes("workbook") || !lower.includes("folder") || !lower.includes("dashboard")) return "";
-  if (!/\b(apply|transfer|copy|populate|update|merge)\b/i.test(raw)) return "";
+function extractPrompt(payload: unknown) {
+  if (!payload || typeof payload !== "object") return "";
+  const response = payload as OpenAIResponse;
+  const outputText = typeof response.output_text === "string" ? response.output_text : "";
+  const contentText = response.output
+    ?.flatMap((item) => item.content || [])
+    .filter((item) => item.type === "output_text" && typeof item.text === "string")
+    .map((item) => item.text as string)
+    .join("\n") || "";
 
-  const folder = raw.match(/\bfolder\s+(\[[^\]\n]+\]|"[^"\n]+"|'[^'\n]+')/i)?.[1];
-  const dashboard = raw.match(/\bdashboard(?:\s+excel)?\s+workbook\s+named\s+(\[[^\]\n]+\]|"[^"\n]+"|'[^'\n]+')/i)?.[1];
-  const workbookMatches = [...raw.matchAll(/\b(?:excel\s+)?workbook\s+named\s+(\[[^\]\n]+\]|"[^"\n]+"|'[^'\n]+')/gi)];
-  const source = workbookMatches.map((match) => match[1]).find((name) => name !== dashboard);
-
-  if (!folder || !source || !dashboard) return "";
-
-  return [
-    `Open folder ${folder}.`,
-    `Find the Excel workbook named ${source}.`,
-    `Review and use the content from ${source}.`,
-    `Open the dashboard Excel workbook named ${dashboard}.`,
-    `Apply the relevant content from ${source} to ${dashboard}.`,
-    `Use only ${source} as the content source; do not add external data.`,
-    "Preserve the dashboard's existing style, layout, formatting, formulas, and structure.",
-    "Do not make any unrelated changes.",
-    `Validate that the applied content matches ${source} and that the dashboard remains intact.`,
-    `Return only the updated dashboard Excel workbook ${dashboard}.`,
-  ].join("\n");
+  return stripMarkdownFence(outputText || contentText).trim();
 }
 
-function makeDirectInstruction(raw: string) {
-  const cleaned = raw.replace(/\s+/g, " ").trim();
-  const withoutLeadIn = cleaned
-    .replace(/^(?:please\s+)?(?:i\s+(?:want|need)\s+you\s+to|can\s+you|could\s+you|would\s+you)\s+/i, "")
-    .trim();
-  const lower = withoutLeadIn.toLowerCase();
-  const executable = /^(add|analyse|analyze|apply|build|check|clean|compare|convert|copy|create|draft|edit|extract|find|fix|generate|get|go|identify|implement|import|open|prepare|produce|refine|remove|replace|research|return|review|rewrite|search|send|summarize|summarise|transfer|update|use|validate|write)\b/.test(lower);
-
-  if (executable) return capitalize(withoutLeadIn);
-  if (/^(a|an)\s+/.test(lower)) return `Create ${withoutLeadIn}.`;
-  return `Complete the following task: ${withoutLeadIn}`;
+function stripMarkdownFence(value: string) {
+  return value.replace(/^```(?:text|markdown)?\s*/i, "").replace(/\s*```$/, "");
 }
 
-function inferOutputContract(raw: string, lower: string) {
-  const updating = /\b(update|updated|edit|edited|revise|revised|complete|completed|apply)\b/i.test(raw);
-  if (/\bdashboard(?:\s+excel)?\s+workbook\b/i.test(raw)) return "the updated dashboard Excel workbook";
-  if (/\b(?:excel\s+)?workbook\b/i.test(raw)) return updating ? "the updated workbook file" : "the requested workbook file";
-  if (/\b(?:word\s+)?document\b/i.test(raw)) return updating ? "the updated document file" : "the requested document file";
-  if (/\b(?:powerpoint\s+)?presentation\b|\bslide deck\b/i.test(raw)) return updating ? "the updated presentation file" : "the requested presentation file";
-  if (/\bjson\b/i.test(raw)) return "the requested JSON";
-  if (/\b(?:updated|edited|revised|completed)\s+(?:file|artifact)\b/i.test(raw)) return "the updated file or artifact";
-  if (/\bfile\b/i.test(raw)) return updating ? "the updated file" : "the requested file";
-  if (/\bemail\b/i.test(raw)) return "the ready-to-send email";
-  if (/\b(message|reply)\b/i.test(raw)) return "the ready-to-send message";
-  if (/\btable\b/i.test(raw)) return "the requested table";
-  if (/\breport\b/i.test(raw)) return "the requested report";
-  if (lower.includes("summary") || /\bsummari[sz]e\b/.test(lower)) return "the requested summary";
-  if (/\b(rewrite|rephrase|refine|polish)\b/.test(lower)) return "the final rewritten text";
-  if (lower.includes("code") || lower.includes("script")) return "the implementation-ready code";
-  if (lower.includes("guidance") || lower.includes("explain")) return "the requested guidance";
-  return "the completed task result";
+function openAiFailureMessage(status: number, payload: unknown) {
+  if (status === 401 || status === 403) return "Prompt generation could not authenticate. Check the server-side OPENAI_API_KEY.";
+  if (status === 429) return "Prompt generation is busy right now. Please wait a moment and try again.";
+  if (status >= 500) return "Prompt generation is temporarily unavailable. Please try again.";
+  const message = payload && typeof payload === "object" && "error" in payload && typeof (payload as { error?: { message?: unknown } }).error?.message === "string"
+    ? (payload as { error: { message: string } }).error.message
+    : "Prompt generation could not be completed. Please try again.";
+  return message.slice(0, 240);
 }
 
-function isFileBasedTask(lower: string) {
-  return /\b(file|folder|workbook|spreadsheet|document|presentation|slide deck|attached|uploaded)\b/.test(lower);
+function toRouteError(error: unknown) {
+  if (error instanceof RouteError) return error;
+  return new RouteError(500, "An unexpected error occurred while generating the prompt.");
 }
 
-function hasPlaceholders(raw: string) {
-  return /\[[^\]\n]+\]|\{[^\}\n]+\}|<[^>\n]+>/.test(raw);
-}
-
-function mentionsSpecifiedSources(lower: string) {
-  return /\b(source[- ]only|using only|use only|specified source|attached|uploaded|provided file|source file|source folder)\b/.test(lower);
-}
-
-function prohibitsExternalData(lower: string) {
-  return /\b(no external data|without external data|do not use external|using only|use only|source[- ]only)\b/.test(lower);
-}
-
-function requiresNoStyleChanges(lower: string) {
-  return /\b(no style changes?|without (?:any )?(?:change|changes) (?:to|on) (?:the )?style|keep (?:the )?(?:style|formatting|layout)|preserve (?:the )?(?:style|formatting|layout))\b/.test(lower);
-}
-
-function requiresExactContent(lower: string) {
-  return /\b(as is|exact wording|exactly as written|do not rewrite|do not change (?:the )?content|unchanged content)\b/.test(lower);
-}
-
-function capitalize(value: string) {
-  return value.charAt(0).toUpperCase() + value.slice(1);
-}
-
-function uniqueLines(lines: string[]) {
-  return [...new Set(lines.map((line) => line.trim()).filter(Boolean))];
-}

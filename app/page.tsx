@@ -9,7 +9,6 @@ type MobileTab = "library" | "search" | "create" | "run";
 type Draft = Prompt & { draft: true; createdAt: string; updatedAt: string };
 type PendingRun = { platformId: PlatformId; platformName: string; promptText: string; url: string; copied: boolean; copyFailed: boolean };
 
-// Configure a server-side prompt builder URL here later. Never place an API key in browser code.
 const PROMPT_BUILDER_ENDPOINT = "/api/prompt-builder";
 
 const AI_PLATFORMS = {
@@ -308,17 +307,19 @@ function CreatePrompt({ drafts, onDrafts, onClose, onRun, flash, showError }: { 
   const generate = async () => {
     if (!request.trim()) { showError("Add a short request first."); return; }
     setGenerating(true);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 20_000);
     try {
-      const response = await fetch(PROMPT_BUILDER_ENDPOINT, { method: "POST", headers: { "Content-Type": "text/plain" }, body: request.trim() });
-      if (!response.ok) throw new Error("Prompt builder request failed");
-      const data = await response.json();
+      const response = await fetch(PROMPT_BUILDER_ENDPOINT, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ request: request.trim() }), signal: controller.signal });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(typeof data?.error === "string" ? data.error : "The prompt could not be generated. Please try again.");
       const generated = typeof data?.prompt === "string" ? data.prompt : "";
       if (!generated) throw new Error("No prompt returned");
       setPreview(generated);
       if (!title.trim()) setTitle(makeDraftTitle(request));
       flash("Prompt generated");
-    } catch { showError("The prompt could not be generated. Check the endpoint configuration."); }
-    finally { setGenerating(false); }
+    } catch (error) { showError(error instanceof Error && error.name === "AbortError" ? "Prompt generation timed out. Please try again." : error instanceof Error ? error.message : "The prompt could not be generated. Please try again."); }
+    finally { window.clearTimeout(timeout); setGenerating(false); }
   };
   const clear = () => { setRequest(""); setTitle(""); setPreview(""); setRunOpen(false); };
   const save = () => {
@@ -343,3 +344,4 @@ function makeDraftTitle(value: string) {
   if (!cleaned) return "";
   return cleaned.length > 56 ? `${cleaned.slice(0, 53).trim()}...` : cleaned;
 }
+
