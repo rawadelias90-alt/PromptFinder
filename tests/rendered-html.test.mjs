@@ -27,6 +27,7 @@ async function loadRoute() {
         },
       }],
       server: { middlewareMode: true },
+      ssr: { noExternal: true },
     });
   }
 
